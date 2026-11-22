@@ -174,6 +174,31 @@ synthesized, so the turn fails with a real message instead of a parse error.
 null-valued typed fields are stripped; `{"error":"str"}` is reshaped to
 `{"error":{"message":"str"}}`.
 
+### Compaction safety
+
+Coralbricks' real prompt ceiling is **1,048,448 tokens**, while OpenCode decides
+to compact only near the model's advertised 1,048,576 — so the compaction
+request itself can land a hair over and the upstream answers **HTTP 200 with an
+in-band `context_length_exceeded` error**. The proxy protects that turn:
+
+- a prompt whose estimated size exceeds `CORALBRICKS_PROXY_PROMPT_TOKENS`
+  (default 800k) is trimmed before the first attempt: system messages plus the
+  newest turns that fit, with one oversized transcript truncated head+tail
+  instead of dropped, and images counted at a flat token cost;
+- if the upstream still reports a context overflow, the body is trimmed once
+  more and retried; if it cannot shrink further the real error is forwarded
+  immediately (never 10 futile same-body retries);
+- a `concurrency_limit` 429 ("1 request at a time per key") makes the retry
+  move to another registered key for that attempt, because the limit is
+  per-credential. The session's pin is unchanged;
+- a clean-but-empty stream on a huge prompt also rotates to the next key;
+- a large tool-less request (OpenCode compaction) skips the tool-call
+  heuristics: a summary that mentions code, braces or file paths is an answer,
+  not a broken file dump;
+- if a compaction summary is cut mid-way after at least 200 characters, the
+  proxy delivers what arrived with a synthetic `finish_reason` + `[DONE]`
+  instead of re-running a 700k-token prompt for minutes.
+
 ### Retry classes
 
 | Failure | Class | Behavior |
@@ -181,6 +206,8 @@ null-valued typed fields are stripped; `{"error":"str"}` is reshaped to
 | `429`, Serverless token-per-minute limit (status or in-band) | patient | retry until it works: 5/7/10/15/20/30s ladder, `Retry-After` honored (cap 60s), 25-min budget |
 | `AiError 8006` body-size, `413` | patient | same-body retry until it works (flaky per attempt) |
 | `503 Service temporarily unavailable` (status or in-band) | never-forward | patient backoff, hard-capped at 10 retries |
+| `concurrency_limit` 429 (one request per key) | per-key | retry on another registered key (1.5s), up to 40 waits |
+| `context_length_exceeded` (HTTP 200 in-band) | trim | trim the prompt (max 2) then forward the real error |
 | other 5xx, network death pre-commit, invalid event pre-commit | hard | 10 retries, then give up |
 | invalid event post-commit | — | dropped inline |
 | upstream death post-commit | — | healed with valid error chunk + `[DONE]` |
@@ -232,6 +259,7 @@ bun index.js            # or: node index.js
 | `CORALBRICKS_PROXY_RL_BUDGET_MS` | `1500000` | patient-retry wall-clock budget |
 | `CORALBRICKS_PROXY_RL_BACKOFF_MS` | `5000,7000,10000,15000,20000,30000` | patient backoff ladder |
 | `CORALBRICKS_PROXY_BACKOFF_MS` | `300,600,1000,2000,3000` | hard-failure backoff ladder |
+| `CORALBRICKS_PROXY_PROMPT_TOKENS` | `800000` | prompt budget; larger prompts are trimmed to fit |
 | `CORALBRICKS_PROXY_PRICING` | coralbricks table | `model=in/out/cached` USD per 1M |
 | `CORALBRICKS_PROXY_USAGE_FILE` | `.coralbricks-usage.json` | lifetime snapshot |
 | `CORALBRICKS_PROXY_USAGE_LOG` | `.coralbricks-usage.jsonl` | per-request log |
@@ -248,7 +276,7 @@ Per-request overrides (stripped before forwarding): `x-cb-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 73 scenarios: the full
+Spins a mock upstream plus the proxy and asserts 78 scenarios: the full
 pre-commit/post-commit retry matrix, null-field repair, mid-stream healing,
 non-stream passthrough, bulk-JSON conversion, stall retry, 200+8006 same-body
 retry, budget exhaustion surfacing the real error, patient TPM retry, vision

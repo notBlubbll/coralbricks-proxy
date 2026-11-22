@@ -670,6 +670,52 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Context overflow arrives as HTTP 200 + an in-band context error; the same
+  // body can never succeed, so the proxy must hand it over after one attempt.
+  "t-compaction-summary": (req, res) => {
+    // A real compaction summary mentions code and braces. The code-dump
+    // heuristic must not treat that as a cut when the request carries no tools.
+    const summary = (
+      'The session edited src/app.ts and src/router.ts, introduced interfaces such as `{ id: string; name: string }`, ' +
+      'ran the build and the test suite, and fixed the failing router case. Tests pass; no errors remain. '
+    ).repeat(20);
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(summary)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
+  // A cut compaction summary (content, then a dead socket) must be delivered
+  // with a synthetic finish instead of retrying the huge prompt.
+  "t-compaction-cut": (req, res) => {
+    const summary = (
+      "The session changed several files, ran the build, fixed the failing router test, and verified the result. "
+    ).repeat(8);
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(summary)}}}]}`,
+      "CLOSE",
+    ]);
+  },
+  "t-context-error": (req, res) => {
+    sse(res, [
+      '{"error":{"message":"This model\'s maximum context length is 1048448 tokens. However, your messages resulted in 1048449 tokens. Please reduce the length of the messages.","type":"invalid_request_error","code":"context_length_exceeded"}}',
+      "[DONE]",
+    ]);
+  },
+  // Per-key concurrency limit: the pinned key answers 429 concurrency_limit,
+  // another pool key answers normally. The proxy must rotate for the retry.
+  "t-concurrency-failover": (req, res) => {
+    if (/cb_test_key_one/.test(req.headers["authorization"] || "")) {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end('{"error":{"message":"Your subscription allows 1 request at a time on this key (background responses included). Retry when it finishes.","type":"rate_limit_error","param":null,"code":"concurrency_limit"}}');
+      return;
+    }
+    sse(res, [
+      '{"choices":[{"delta":{"content":"failover-ok"}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -1110,6 +1156,27 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-legit-code-answer", stream: true }, BUFFER_PORT);
     check("Z26: fenced code answer not retried", hitCount === 1 && textOf(r.text).includes("const a = 1;") && textOf(r.text).includes("Done."), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
 
+    // Compaction: a >1.2 MB tool-less request whose summary mentions code must
+    // pass through as an answer, not be retried as a "code dump".
+    hitCount = 0;
+    const compactionPrompt = "Conversation transcript: " + "The build ran, files changed, tests passed. ".repeat(28000);
+    r = await readSSE("/v1/chat/completions", {
+      model: "t-compaction-summary",
+      stream: true,
+      max_tokens: 32768,
+      messages: [{ role: "user", content: compactionPrompt }],
+    }, BUFFER_PORT);
+    check("Z27b: compaction summary with code-like text is not retried", hitCount === 1 && textOf(r.text).includes("Tests pass") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text.slice(0, 300))}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", {
+      model: "t-compaction-cut",
+      stream: true,
+      max_tokens: 32768,
+      messages: [{ role: "user", content: compactionPrompt }],
+    }, BUFFER_PORT);
+    check("Z27c: cut compaction summary is delivered, not retried", hitCount === 1 && textOf(r.text).includes("failing router test") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text.slice(0, 300))}`);
+
     // ---- key pool + usage accounting (streaming proxy) ----
     const api = `http://127.0.0.1:${PROXY_PORT}`;
     const postJson = (pathName, obj) => fetch(`${api}${pathName}`, {
@@ -1151,6 +1218,24 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
 
     keys = await postJson("/keys", { remove: 3 });
     check("K6: key removal drops the last slot", keys.keys.length === 2 && keys.keys[1].hint === "…_two", JSON.stringify(keys.keys));
+
+    // Context overflow is deterministic: one attempt, then the real error.
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-context-error", stream: true });
+    check("K7: context overflow forwarded once with the real error", hitCount === 1 && r.text.includes("maximum context length") && r.retries === "0", `hits=${hitCount} retries=${r.retries} text=${JSON.stringify(r.text)}`);
+
+    // Per-key concurrency limit: rotate to an idle key instead of waiting.
+    hitCount = 0;
+    const concRes = await fetch(`${api}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer test-key", "x-opencode-session-id": "ses_concurrency_test" },
+      body: JSON.stringify({ model: "t-concurrency-failover", stream: true }),
+    });
+    const concText = await concRes.text();
+    check("K8: concurrency limit fails over to another key", hitCount === 2 && concRes.headers.get("x-cb-retries") === "1" && textOf(concText).includes("failover-ok"), `hits=${hitCount} retries=${concRes.headers.get("x-cb-retries")} text=${JSON.stringify(concText)}`);
+
+    keys = await fetch(`${api}/keys`).then((x) => x.json());
+    check("K9: rotation is per attempt; the session keeps its pin", keys.pins["ses_concurrency_test"] === 1, JSON.stringify(keys.pins));
 
     bufferProxy.kill();
   } catch (e) {

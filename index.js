@@ -1375,6 +1375,125 @@ function snippet(s, n = 220) {
   return one.length > n ? one.slice(0, n) + "…" : one;
 }
 
+// ---------- prompt budget / trimming ----------
+// coralbricks' real prompt limit is 1,048,448 tokens (1,048,576 minus 128),
+// while OpenCode compacts only once its own estimate is near the 1,048,576
+// limit — so the compaction request itself can end up a hair over and the
+// upstream answers HTTP 200 with an in-band "maximum context length" error.
+// The proxy keeps requests under a hard prompt budget: system messages plus the
+// newest turns that fit, with images counted at a flat token cost. A request
+// that is already under budget is forwarded byte-exact.
+const CONTEXT_ERROR_RE = /(maximum context length|context_length_exceeded|resulted in \d+ tokens|reduce the length of the messages|too many tokens)/i;
+const CONCURRENCY_RE = /(concurrency_limit|1 request at a time|background responses)/i;
+const PROMPT_TOKEN_BUDGET = Math.max(100000, Number(process.env.CORALBRICKS_PROXY_PROMPT_TOKENS) || 800000);
+const PROMPT_CHAR_BUDGET = PROMPT_TOKEN_BUDGET * 4;
+const IMAGE_TOKEN_CHARS = 6000; // ~1.5k tokens per image part
+const TRIM_NOTE = "Note: older messages were truncated by coralbricks-proxy to fit the model's context window.";
+
+function partChars(part) {
+  if (!part || typeof part !== "object") return String(part ?? "").length;
+  if (part.type === "image_url" || part.type === "image" || part.type === "input_image") return IMAGE_TOKEN_CHARS;
+  if (typeof part.text === "string") return part.text.length;
+  return JSON.stringify(part).length;
+}
+
+function contentChars(content) {
+  if (typeof content === "string") return content.length;
+  if (Array.isArray(content)) return content.reduce((n, p) => n + partChars(p), 0);
+  if (content && typeof content === "object") return JSON.stringify(content).length;
+  return 0;
+}
+
+function messageChars(m) { return contentChars(m && m.content) + 64; }
+
+function effectivePromptChars(json) {
+  let n = 0;
+  const msgs = Array.isArray(json && json.messages) ? json.messages : [];
+  for (const m of msgs) n += messageChars(m);
+  if (json && json.tools) n += JSON.stringify(json.tools).length;
+  return n;
+}
+
+// Shrink one oversized message instead of dropping it: keep its head and tail
+// (the beginning sets the topic, the end is what the summary must cover) and
+// flatten image parts into short text notes.
+function truncateMessage(m, maxChars) {
+  if (!m || typeof m !== "object") return null;
+  const budget = Math.max(500, maxChars);
+  const cut = (s) => {
+    if (s.length <= budget) return s;
+    const head = Math.floor(budget * 0.6);
+    const tail = Math.max(0, budget - head - 40);
+    return s.slice(0, head) + "\n\n[…truncated to fit the context window…]\n\n" + (tail > 0 ? s.slice(-tail) : "");
+  };
+  if (typeof m.content === "string") {
+    return { ...m, content: cut(m.content) };
+  }
+  if (Array.isArray(m.content)) {
+    const text = m.content.map((p) => {
+      if (p && typeof p === "object" && (p.type === "image_url" || p.type === "image" || p.type === "input_image")) {
+        return "[image omitted to fit the context window]";
+      }
+      if (p && typeof p === "object" && typeof p.text === "string") return p.text;
+      return typeof p === "string" ? p : "";
+    }).filter(Boolean).join("\n");
+    return { ...m, content: cut(text) };
+  }
+  return null;
+}
+
+// Keep every system/developer message and the newest turns that fit
+// `budgetChars`. A message that does not fit whole is truncated (head + tail)
+// so a single giant transcript still reaches the summarizer. Older messages
+// are dropped and a short system note is added. Returns true when the body
+// changed.
+function trimMessagesForBudget(json, budgetChars) {
+  const msgs = Array.isArray(json && json.messages) ? json.messages : null;
+  if (!msgs || msgs.length < 2) return false;
+  if (effectivePromptChars(json) <= budgetChars) return false;
+  const system = [];
+  const rest = [];
+  for (const m of msgs) {
+    if (m && (m.role === "system" || m.role === "developer")) system.push(m);
+    else rest.push(m);
+  }
+  const keep = [];
+  let used = system.reduce((n, m) => n + messageChars(m), 0);
+  const noteChars = TRIM_NOTE.length + 64;
+  let changed = false;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const m = rest[i];
+    const size = messageChars(m);
+    if (used + noteChars + size <= budgetChars) {
+      keep.unshift(m);
+      used += size;
+      continue;
+    }
+    const remaining = budgetChars - used - noteChars - 64;
+    if (remaining >= 1000) {
+      const shrunk = truncateMessage(m, remaining);
+      if (shrunk) {
+        keep.unshift(shrunk);
+        used += messageChars(shrunk);
+        changed = true;
+      }
+    }
+    if (keep.length > 0) break; // older messages cannot fit after this point
+  }
+  if (keep.length === rest.length && !changed) return false;
+  // Never start the kept tail with an orphaned tool result (or an assistant
+  // tool-call whose results were dropped): the upstream rejects both.
+  while (keep.length > 1) {
+    const m = keep[0];
+    const orphanTool = m && m.role === "tool";
+    const orphanCall = m && m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+    if (!orphanTool && !orphanCall) break;
+    keep.shift();
+  }
+  json.messages = [...system, { role: "system", content: TRIM_NOTE }, ...keep];
+  return true;
+}
+
 function buildForwardHeaders(inbound, extra) {
   const h = {};
   for (const [k, v] of Object.entries(inbound)) {
@@ -1557,6 +1676,14 @@ async function startServer(upstreamBase, port, mode) {
       wantsStream = reqJson?.stream === true;
       model = reqJson?.model || "?";
     } catch {}
+    // Compaction (and other simple calls) carry no tools. The text-tool and
+    // code-dump heuristics exist to repair tool calls; without tools they only
+    // misclassify prose that mentions code, so they are disabled.
+    const hasTools = Array.isArray(reqJson?.tools) && reqJson.tools.length > 0;
+    // A large tool-less request is OpenCode compaction: prose about the
+    // conversation, not a coding turn. Tool-call heuristics must stay out of it.
+    const compactionLike = !hasTools && reqSize > 1200000;
+    const toolHeuristics = !compactionLike;
     // Ask the upstream for its token counts even when the caller did not: usage
     // accounting is worthless without them, and the field is standard.
     if (wantsStream && reqJson && typeof reqJson === "object" && !Array.isArray(reqJson)) {
@@ -1565,6 +1692,18 @@ async function startServer(upstreamBase, port, mode) {
         reqJson.stream_options.include_usage = true;
         rawBody = Buffer.from(JSON.stringify(reqJson), "utf8");
         reqSize = rawBody.length;
+      }
+    }
+    // Keep the prompt under the model's real limit before the first attempt. A
+    // compaction request is exactly the one that lands over the line, and the
+    // upstream rejects it with HTTP 200 + an in-band context error, which would
+    // otherwise be retried unchanged until the budget runs out.
+    if (reqJson && Array.isArray(reqJson.messages)) {
+      const promptChars = effectivePromptChars(reqJson);
+      if (promptChars > PROMPT_CHAR_BUDGET && trimMessagesForBudget(reqJson, PROMPT_CHAR_BUDGET)) {
+        rawBody = Buffer.from(JSON.stringify(reqJson), "utf8");
+        reqSize = rawBody.length;
+        log(`prompt over budget (~${Math.round(promptChars / 4)} tokens) — trimmed to ~${Math.round(effectivePromptChars(reqJson) / 4)} tokens, ${reqSize} bytes`);
       }
     }
     // Only streaming chat requests drive the retry pill. Non-stream image
@@ -1578,7 +1717,7 @@ async function startServer(upstreamBase, port, mode) {
     ) || null;
     // Which credential this request goes out on. An explicit x-cb-key override
     // wins; otherwise the session's pinned key; also see the auth block below.
-    const keySlot = keyPool.length > 0 ? keySlotForSession(sessionId) : 0;
+    let keySlot = keyPool.length > 0 ? keySlotForSession(sessionId) : 0;
     const sessionAct = sessionId ? touchSession(sessionId, model) : null;
     if (sessionAct) sessionAct.active++;
     res.on("close", () => { if (sessionAct) sessionAct.active = Math.max(0, sessionAct.active - 1); });
@@ -1715,11 +1854,13 @@ async function startServer(upstreamBase, port, mode) {
     // > the caller's own Authorization > the single-key fallback env var.
     const keyOverride = req.headers["x-cb-key"] || req.headers["x-lf-key"];
     let auth = null;
+    let onPool = false;
     if (typeof keyOverride === "string" && keyOverride.trim()) {
       const k = keyOverride.trim();
       auth = /^bearer /i.test(k) ? k : `Bearer ${k}`;
     } else if (keySlot >= 1 && keySlot <= keyPool.length) {
       auth = `Bearer ${keyPool[keySlot - 1]}`;
+      onPool = true;
     } else {
       auth = req.headers["authorization"];
       if (!auth && process.env.CORALBRICKS_PROXY_KEY) auth = `Bearer ${process.env.CORALBRICKS_PROXY_KEY}`;
@@ -1789,6 +1930,10 @@ async function startServer(upstreamBase, port, mode) {
     let neverForwardFailures = 0;
     let rlStreak = 0;
     let attemptsUsed = 0;
+    // Context-overflow and per-key concurrency handling.
+    let contextTrims = 0;      // reactive trims after a context error (max 2)
+    let concurrencyWaits = 0;  // consecutive "1 request at a time" 429s
+    const MAX_CONCURRENCY_WAITS = 40;
     // Post-commit continuation: when the upstream cuts a stream mid-answer
     // (no finish_reason/[DONE]) or sends a transient error after content, we
     // retry the SAME request and skip the prefix already sent to the client,
@@ -1802,6 +1947,37 @@ async function startServer(upstreamBase, port, mode) {
     let continuationPrefix = null;
     let continuationAttempts = 0;
     const MAX_CONTINUATION = 3;
+    // Shrink the prompt after a context-overflow error. Returns true when the
+    // body changed and the attempt can be retried with it.
+    const retrimForContext = () => {
+      if (contextTrims >= 2 || !reqJson) return false;
+      contextTrims++;
+      const current = effectivePromptChars(reqJson);
+      const budget = Math.max(400000, Math.round(current * 0.6));
+      if (!trimMessagesForBudget(reqJson, budget)) return false;
+      rawBody = Buffer.from(JSON.stringify(reqJson), "utf8");
+      reqSize = rawBody.length;
+      log(`context overflow — trimmed to ~${Math.round(effectivePromptChars(reqJson) / 4)} tokens (${reqSize} bytes), retry ${contextTrims}/2`);
+      return true;
+    };
+    // coralbricks allows one request per key and keeps counting an abandoned
+    // stream as a "background response", so a pinned key can stay blocked for
+    // minutes after a failed attempt. Try the retry on another pooled key.
+    const MAX_KEY_ROTATIONS = keyPool.length > 1 ? 4 : 0;
+    let keyRotations = 0;
+    const rotateKey = (why) => {
+      if (!onPool || keyPool.length < 2 || keyRotations >= MAX_KEY_ROTATIONS) return false;
+      keyRotations++;
+      const prev = keySlot;
+      keySlot = (keySlot % keyPool.length) + 1;
+      auth = `Bearer ${keyPool[keySlot - 1]}`;
+      if (wantsStream && streamId !== null) {
+        const s = proxyState.streams.get(streamId);
+        if (s) { s.keySlot = keySlot; s.updated = Date.now(); }
+      }
+      log(`${why} on key ${prev} — trying key ${keySlot} (${maskKey(keyPool[keySlot - 1])})`);
+      return true;
+    };
     for (let attempt = 1; ; attempt++) {
       attemptsUsed = attempt;
       if (wantsStream && streamId !== null) {
@@ -1830,6 +2006,7 @@ async function startServer(upstreamBase, port, mode) {
       try {
         // raw socket upstream call — never reuse a consumed init (tinyproxy v10)
         const reqHeaders = { ...fwdHeaders };
+        if (auth) reqHeaders.authorization = auth;
         if (reqSize > 0) reqHeaders["content-length"] = String(reqSize);
         up = await upstreamRequest(target, { method: req.method, headers: reqHeaders, body: reqSize > 0 ? rawBody : undefined });
         lastStatus = up.statusCode;
@@ -1854,7 +2031,22 @@ async function startServer(upstreamBase, port, mode) {
             // NEVER_FORWARD classes have no budget: they are retried until
             // success or client disconnect so the client never sees them.
             const neverForward = NEVER_FORWARD_RE.test(text);
-            const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
+            const concurrency = onPool && CONCURRENCY_RE.test(text);
+            let wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
+            if (concurrency) {
+              concurrencyWaits++;
+              if (concurrencyWaits > MAX_CONCURRENCY_WAITS) {
+                log(`attempt ${attempt}: ${lastFailure} — concurrency retries exhausted`);
+                break;
+              }
+              // coralbricks allows one request at a time PER KEY, and a stream
+              // the proxy abandoned keeps counting as a "background response".
+              // Another registered key is idle, so move the retry there.
+              if (!rotateKey("concurrency limit")) {
+                // All keys are busy; keep the patient wait.
+              }
+              wait = 1500;
+            }
             if (neverForward) {
               neverForwardFailures++;
               if (neverForwardFailures > MAX_RETRIES) { log(`attempt ${attempt}: ${lastFailure} — never-forward retries exhausted`); break; }
@@ -1969,6 +2161,7 @@ async function startServer(upstreamBase, port, mode) {
         let bailed = false;
         let bailedRLFlag = false;
         let bailedNeverForward = false;
+        let bailedContext = false;
         let bailedPostCommit = false;
         let continuationFailed = false;
         let drops = 0;
@@ -2118,11 +2311,13 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           if (isErrorPayload(data) && !dataCommitted) {
+            const context = CONTEXT_ERROR_RE.test(data);
             return {
               bail: `error event pre-commit: ${snippet(data)}`,
               rateLimited: RATE_LIMIT_RE.test(data) || PATIENT_SIZE_RE.test(data) || TRANSIENT_RE.test(data),
               neverForward: NEVER_FORWARD_RE.test(data),
               errorBody: data,
+              context,
             };
           }
           // Post-commit transient error: suppress it. The client cannot
@@ -2159,7 +2354,7 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           // Convert a text DSML edit block into a real edit tool call.
-          const dsmlEdit = parseDsmlEdit(contentDelta(data));
+          const dsmlEdit = toolHeuristics ? parseDsmlEdit(contentDelta(data)) : null;
           if (dsmlEdit) {
             dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
@@ -2185,7 +2380,7 @@ async function startServer(upstreamBase, port, mode) {
           // Broken edits are judged on the whole buffered turn (a split block
           // is fine until the turn ends), so nothing is decided per chunk.
           // Convert a bare image path into a real read tool call.
-          const bareImage = parseBareImageRead(contentDelta(data), sentContent);
+          const bareImage = toolHeuristics ? parseBareImageRead(contentDelta(data), sentContent) : null;
           if (bareImage) {
             dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
@@ -2209,7 +2404,7 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           // Convert a text DSML shell block into a real shell tool call.
-          const dsmlShell = parseDsmlShell(contentDelta(data));
+          const dsmlShell = toolHeuristics ? parseDsmlShell(contentDelta(data)) : null;
           if (dsmlShell) {
             dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
@@ -2233,7 +2428,7 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           // Convert a text DSML write block into a real write tool call.
-          const dsmlWrite = parseDsmlWrite(contentDelta(data));
+          const dsmlWrite = toolHeuristics ? parseDsmlWrite(contentDelta(data)) : null;
           if (dsmlWrite) {
             dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
@@ -2257,7 +2452,7 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           // Convert a text DSML grep block into a real grep tool call.
-          const dsmlGrep = parseDsmlGrep(contentDelta(data));
+          const dsmlGrep = toolHeuristics ? parseDsmlGrep(contentDelta(data)) : null;
           if (dsmlGrep) {
             dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
@@ -2281,7 +2476,7 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           // Convert a text DSML read block into a real read tool call.
-          const dsmlRead = parseDsmlRead(contentDelta(data));
+          const dsmlRead = toolHeuristics ? parseDsmlRead(contentDelta(data)) : null;
           if (dsmlRead) {
             dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
@@ -2315,13 +2510,14 @@ async function startServer(upstreamBase, port, mode) {
             // be split across many small chunks, so no single chunk matches).
             // Retrying it here would loop forever instead of converting it.
             const dsmlText = hasDsmlMarkers(combined);
-            const codeDump = !dsmlText && looksLikePartialCode(combined);
-            const textTool = !dsmlText && looksLikeTextToolCall(combined);
+            const codeDump = toolHeuristics && !dsmlText && looksLikePartialCode(combined);
+            const textTool = toolHeuristics && !dsmlText && looksLikeTextToolCall(combined);
             // A DSML/text tool call streamed as content can finish with
             // tool_calls even though no structured tool call was sent. Treat
             // it like a code dump: retry, then hand off any real tool call.
-            const bareEdit = BUFFER_UNTIL_COMPLETE && looksLikeBarePathEdit(combined);
+            const bareEdit = toolHeuristics && BUFFER_UNTIL_COMPLETE && looksLikeBarePathEdit(combined);
             const abrupt = (finishReason === "stop" || finishReason === "length" || finishReason === "tool_calls")
+              && !compactionLike
               && (looksIncomplete(combined) || codeDump || textTool || bareEdit);
             // A prior Read/tool call in the same turn must not block a code
             // dump continuation; the retry may reproduce the text or hand off
@@ -2375,9 +2571,10 @@ async function startServer(upstreamBase, port, mode) {
             if (BUFFER_UNTIL_COMPLETE && !sawFinish && !sawToolCalls && !syntheticToolCall) {
               const combined = sentContent;
               const dsmlText = hasDsmlMarkers(combined);
-              if (looksIncomplete(combined)
-                  || (!dsmlText && (looksLikePartialCode(combined) || looksLikeTextToolCall(combined)))
-                  || looksLikeBarePathEdit(combined)) {
+              if (!compactionLike
+                  && (looksIncomplete(combined)
+                    || (toolHeuristics && !dsmlText && (looksLikePartialCode(combined) || looksLikeTextToolCall(combined)))
+                    || (toolHeuristics && looksLikeBarePathEdit(combined)))) {
                 bufferAbrupt = true;
                 return null;
               }
@@ -2414,6 +2611,7 @@ async function startServer(upstreamBase, port, mode) {
             let bail = null;
             let bailRL = false;
             let bailNeverForward = false;
+            let bailContext = false;
             let bailPostCommit = false;
             let bailContinuationFailed = false;
             for (const raw of events) {
@@ -2422,6 +2620,7 @@ async function startServer(upstreamBase, port, mode) {
                 bail = r.bail;
                 bailRL = r.rateLimited;
                 bailNeverForward = !!r.neverForward;
+                bailContext = !!r.context;
                 bailPostCommit = !!r.postCommit;
                 bailContinuationFailed = !!r.continuationFailed;
                 if (r.errorBody) lastStatusBody = r.errorBody;
@@ -2435,6 +2634,7 @@ async function startServer(upstreamBase, port, mode) {
               bailed = true;
               bailedRLFlag = bailRL;
               bailedNeverForward = bailNeverForward;
+              bailedContext = bailContext;
               bailedPostCommit = bailPostCommit;
               continuationFailed = bailContinuationFailed;
               break;
@@ -2451,6 +2651,7 @@ async function startServer(upstreamBase, port, mode) {
                 bailed = true;
                 bailedRLFlag = r.rateLimited;
                 bailedNeverForward = !!r.neverForward;
+                bailedContext = !!r.context;
                 bailedPostCommit = !!r.postCommit;
                 continuationFailed = !!r.continuationFailed;
                 break;
@@ -2475,14 +2676,14 @@ async function startServer(upstreamBase, port, mode) {
             } catch {}
           }
           const joinedAll = dsmlRaw + joinedContent;
-          const incompleteEdit = isIncompleteDsmlEdit(joinedAll);
+          const incompleteEdit = toolHeuristics && isIncompleteDsmlEdit(joinedAll);
           // Raw DSML that no parser can convert (truncated block, unknown
           // shape) is a broken turn: retry instead of showing it to the client.
           // Scan the raw buffered SSE too, so a reconstruction gap can never
           // leak DSML text.
           const rawBuffered = buffered.map(String).join("");
           const dsmlPresent = hasDsmlMarkers(joinedAll) || hasDsmlMarkers(rawBuffered);
-          const unconvertibleDsml = dsmlPresent && !parseAnyDsml(joinedAll);
+          const unconvertibleDsml = toolHeuristics && dsmlPresent && !parseAnyDsml(joinedAll);
           const complete = !bufferAbrupt && !bufferFailed && !incompleteEdit && !unconvertibleDsml && (sawDone || sawFinish);
           if (complete) {
             ensureStreamHeaders({}, retryCount);
@@ -2503,7 +2704,7 @@ async function startServer(upstreamBase, port, mode) {
                 } catch {}
               }
               if (text) {
-                const call = hasDsmlMarkers(text) ? parseAnyDsml(text) : parseBareImageRead(text, "");
+                const call = toolHeuristics ? (hasDsmlMarkers(text) ? parseAnyDsml(text) : parseBareImageRead(text, "")) : null;
                 if (call) {
                   const p = call.arguments.filePath || call.arguments.path || "";
                   const tagA = text.indexOf("< | DSML |");
@@ -2532,9 +2733,46 @@ async function startServer(upstreamBase, port, mode) {
             recordUsageOnce();
             return;
           }
-          if (!bailed) lastFailure = `buffered stream failed (sawDone=${sawDone} sawFinish=${sawFinish} err=${lastErr?.message || lastErr || "none"})`;
+          if (!bailed) lastFailure = `buffered stream failed (sawDone=${sawDone} sawFinish=${sawFinish} abrupt=${bufferAbrupt} failed=${bufferFailed} dsml=${unconvertibleDsml} incompleteEdit=${incompleteEdit} err=${lastErr?.message || lastErr || "none"})`;
           log(`req ${pathAndQuery}: buffered stream failed; retrying (${lastFailure})`);
+          // A compaction summary that was cut mid-way is still a useful
+          // summary. Deliver what arrived (with a synthetic finish) instead of
+          // retrying a 700k-token prompt for minutes; the client can move on.
+          if (compactionLike && !bailed && sentContent.length > 200) {
+            ensureStreamHeaders({}, retryCount);
+            if (!sawFinish) buffered.push(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+            if (!sawDone) buffered.push("data: [DONE]\n\n");
+            for (const chunk of buffered) { try { rawWrite(chunk); } catch {} }
+            endStream();
+            try { up.destroy(); } catch {}
+            recordUsageOnce();
+            log(`req ${pathAndQuery}: compaction summary cut after ${sentContent.length} chars — delivered the partial summary`);
+            return;
+          }
           buffered.length = 0;
+          // A clean but empty stream (no finish, no content) while the pinned
+          // key is stuck behind its own abandoned background response: try the
+          // next key instead of hammering the same one.
+          if (!bailed && !sawDone && !sawFinish && rotateKey("empty stream")) {
+            try { up.destroy(); } catch {}
+            await retryPause(800);
+            continue;
+          }
+          // Context overflow: the same body can never succeed. Trim the prompt
+          // and retry (twice at most), then forward the real error.
+          if (bailed && bailedContext) {
+            try { up.destroy(); } catch {}
+            if (retrimForContext()) { await retryPause(300); continue; }
+            log(`context overflow — no trim possible; forwarding the real context error`);
+            break;
+          }
+          // A huge prompt that comes back as a clean but empty stream is the
+          // other shape of the same problem (the upstream drops it instead of
+          // sending the context error). Trim and retry once or twice.
+          if (!bailed && !sawDone && !sawFinish && contextTrims < 2
+              && effectivePromptChars(reqJson) > 2800000) {
+            if (retrimForContext()) { await retryPause(300); continue; }
+          }
           // Nothing was sent to the client in buffer mode, so the failed
           // attempt's text must not feed the next attempt's completeness
           // checks (it made every retry look like a cut answer).
@@ -2621,6 +2859,19 @@ async function startServer(upstreamBase, port, mode) {
           lastFailure = `stream ended with no valid events (err=${lastErr?.message || lastErr || "none"})`;
         }
         log(`attempt ${attempt}: pre-commit failure: ${lastFailure}`);
+        // Context overflow: the same body can never succeed. Trim the prompt
+        // and try again (twice at most), then hand the real error to the client
+        // instead of burning the 10 hard retries on a deterministic failure.
+        if (bailed && bailedContext) {
+          if (retrimForContext()) { await retryPause(300); continue; }
+          log(`context overflow — no trim possible; forwarding the real context error`);
+          break;
+        }
+        // Same stale-background-response case outside buffer mode.
+        if (!bailed && !sawDone && !sawFinish && rotateKey("empty stream")) {
+          await retryPause(800);
+          continue;
+        }
         if (bailed && bailedRLFlag) {
           // rate-limited / transient in-stream: patient retry. NEVER_FORWARD
           // classes ignore the time budget but still obey the hard retry cap.
