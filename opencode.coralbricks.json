@@ -1,0 +1,26 @@
+{
+  "coralbricks": {
+    "name": "Coralbricks",
+    "package": "@opencode-ai/ai/providers/openai-compatible",
+    "settings": {
+      "baseURL": "http://127.0.0.1:17332/v1",
+      "apiKey": "unused-key-pool-active",
+      "timeout": 1800000,
+      "headerTimeout": 600000,
+      "chunkTimeout": 600000
+    },
+    "models": {
+      "coralbricks/deepseek-v4.1-flash-value": {
+        "name": "DeepSeek V4.1 Flash Value",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 1048576, "output": 32768 },
+        "variants": [
+          { "id": "low", "settings": { "reasoningEffort": "low" } },
+          { "id": "high", "settings": { "reasoningEffort": "high" } },
+          { "id": "max", "settings": { "reasoningEffort": "max" } }
+        ]
+      }
+    }
+  }
+}

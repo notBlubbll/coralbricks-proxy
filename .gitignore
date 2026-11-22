@@ -1,0 +1,14 @@
+# live credentials — never commit
+keys.json
+/*/keys.json
+
+# runtime state
+.coralbricks-proxy.log
+.coralbricks-usage.json
+.coralbricks-usage.jsonl
+.mind-automation-state.json
+
+# tooling
+node_modules/
+Thumbs.db
+.DS_Store
