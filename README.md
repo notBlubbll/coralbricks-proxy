@@ -15,8 +15,13 @@ The request body (including the model id) is forwarded byte-exact apart from
 upstream returns its token counts.
 
 > coralbricks currently serves exactly one model:
-> `coralbricks/deepseek-v4.1-flash-value` (1,048,576 context, tools, images,
-> reasoning efforts low/high/max).
+> `coralbricks/deepseek-v4.1-flash-value` (1,048,576 context, tools, images).
+> Reasoning efforts: `/v1/models` advertises **low / high / max**, with `none`
+> disabling thinking; an unsupported value (`ultra`) is rejected with a 400 that
+> lists exactly those four. **`xhigh` is accepted (HTTP 200) but not
+> advertised** — measured reasoning-token budgets land in the same tier as
+> `max`, so the sample config exposes `xhigh` as an alias of `max`. `minimal`
+> and `medium` are also silently accepted and behave like `low`/`high`.
 
 ## Why
 

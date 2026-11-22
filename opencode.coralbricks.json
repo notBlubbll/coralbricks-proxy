@@ -18,6 +18,7 @@
         "variants": [
           { "id": "low", "settings": { "reasoningEffort": "low" } },
           { "id": "high", "settings": { "reasoningEffort": "high" } },
+          { "id": "xhigh", "settings": { "reasoningEffort": "max" } },
           { "id": "max", "settings": { "reasoningEffort": "max" } }
         ]
       }
