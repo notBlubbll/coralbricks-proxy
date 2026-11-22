@@ -1679,10 +1679,11 @@ async function startServer(upstreamBase, port, mode) {
     // Compaction (and other simple calls) carry no tools. The text-tool and
     // code-dump heuristics exist to repair tool calls; without tools they only
     // misclassify prose that mentions code, so they are disabled.
-    const hasTools = Array.isArray(reqJson?.tools) && reqJson.tools.length > 0;
-    // A large tool-less request is OpenCode compaction: prose about the
-    // conversation, not a coding turn. Tool-call heuristics must stay out of it.
-    const compactionLike = !hasTools && reqSize > 1200000;
+    // A large prompt is the context-limit/compaction case: the answer is prose
+    // about the conversation, so tool-call heuristics must not treat its code
+    // mentions as a broken file dump. OpenCode keeps the tool list in the
+    // compaction request, so this cannot key off the tool list alone.
+    const compactionLike = reqSize > 1000000;
     const toolHeuristics = !compactionLike;
     // Ask the upstream for its token counts even when the caller did not: usage
     // accounting is worthless without them, and the field is standard.

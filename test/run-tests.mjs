@@ -1164,6 +1164,9 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
       model: "t-compaction-summary",
       stream: true,
       max_tokens: 32768,
+      // OpenCode keeps its tool list in the compaction request; the size, not
+      // the absence of tools, must switch the tool heuristics off.
+      tools: [{ type: "function", function: { name: "read", parameters: { type: "object", properties: {} } } }],
       messages: [{ role: "user", content: compactionPrompt }],
     }, BUFFER_PORT);
     check("Z27b: compaction summary with code-like text is not retried", hitCount === 1 && textOf(r.text).includes("Tests pass") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text.slice(0, 300))}`);
