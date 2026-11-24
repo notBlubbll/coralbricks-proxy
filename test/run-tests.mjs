@@ -670,6 +670,18 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Two identical large requests in flight: the second waits for the first and
+  // replays its answer, so the upstream only generates once.
+  "t-compaction-dedupe": (req, res) => {
+    setTimeout(() => {
+      const summary = ("Deduped compaction summary: files changed, build passed, tests passed. ").repeat(10);
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(summary)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }, 400);
+  },
   // Context overflow arrives as HTTP 200 + an in-band context error; the same
   // body can never succeed, so the proxy must hand it over after one attempt.
   "t-compaction-summary": (req, res) => {
@@ -1179,6 +1191,22 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
       messages: [{ role: "user", content: compactionPrompt }],
     }, BUFFER_PORT);
     check("Z27c: cut compaction summary is delivered, not retried", hitCount === 1 && textOf(r.text).includes("failing router test") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text.slice(0, 300))}`);
+
+    // Identical retries share one upstream generation.
+    hitCount = 0;
+    const dedupeBody = {
+      model: "t-compaction-dedupe",
+      stream: true,
+      max_tokens: 32768,
+      messages: [{ role: "user", content: compactionPrompt }],
+    };
+    const dedupeReq = () => fetch(`http://127.0.0.1:${BUFFER_PORT}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer test-key", "x-opencode-session-id": "ses_dedupe_test" },
+      body: JSON.stringify(dedupeBody),
+    }).then((x) => x.text());
+    const [d1, d2] = await Promise.all([dedupeReq(), dedupeReq()]);
+    check("Z27d: identical in-flight compaction requests share one generation", hitCount === 1 && textOf(d1).includes("Deduped compaction summary") && textOf(d2).includes("Deduped compaction summary"), `hits=${hitCount} d1=${JSON.stringify(d1.slice(0, 140))} d2=${JSON.stringify(d2.slice(0, 140))}`);
 
     // ---- key pool + usage accounting (streaming proxy) ----
     const api = `http://127.0.0.1:${PROXY_PORT}`;

@@ -847,15 +847,20 @@ module.exports = {
           const s = proxyStatus();
           const e = s && s.sessions && input.session ? s.sessions[input.session.id] : null;
           const code = e && Number.isFinite(e.status) ? e.status : null;
+          // Only a real failure status is worth showing; an internal retry of a
+          // 200 stream (cut/empty) must not read "retrying … HTTP 200".
+          const showCode = code !== null && code >= 400;
           const suffix = e && e.retries > 0
-            ? ` · retrying ${e.retries}${code !== null ? ` · HTTP ${code}` : ""}`
+            ? ` · retrying ${e.retries}${showCode ? ` · HTTP ${code}` : ""}`
             : "";
           return {
             label: `Working (${formatSeconds(seconds)}${suffix})`,
             icon: "status",
             tone: e && e.retries > 0 ? "warning" : undefined,
             title: e && e.retries > 0
-              ? `${e.model || "request"}${code !== null ? ` returned ${code}` : " failed"}; the proxy is retrying`
+              ? (showCode
+                ? `${e.model || "request"} returned ${code}; the proxy is retrying`
+                : `${e.model || "request"} was cut early; the proxy is re-sending it`)
               : "Session is running",
           };
         },

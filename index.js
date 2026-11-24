@@ -160,6 +160,10 @@ const TAG = "[coralbricks-proxy]";
 // suffix). Streaming requests are tracked per-request so one stream's retry
 // state can never leak into another stream (or a concurrent image generation).
 const proxyState = { active: 0, streams: new Map(), streamSeq: 0, updated: 0 };
+// Large identical requests (OpenCode retrying the same compaction body while
+// the first copy is still generating) are coalesced: one generation runs and
+// the retries replay its buffered answer instead of occupying another key.
+const largeInflight = new Map();
 const UPSTREAM_DEFAULT = "https://inference.coralbricks.ai/v1";
 const LISTEN_HOST = "127.0.0.1";
 const PORT_DEFAULT = 17332;
@@ -1731,6 +1735,58 @@ async function startServer(upstreamBase, port, mode) {
       });
     }
 
+    // ---- coalesce identical large requests --------------------------------
+    // OpenCode retries the same oversized compaction body while the first copy
+    // is still generating; every retry would occupy another key ("1 request at
+    // a time, background responses included"). The first copy keeps draining to
+    // completion even if its client disconnects, and the retries wait for it
+    // and replay the buffered answer.
+    let dedupeEntry = null;
+    let drainAnyway = false;
+    const dedupeKey = compactionLike && sessionId
+      ? createHash("sha256").update(sessionId).update(rawBody).digest("hex")
+      : null;
+    if (dedupeKey) {
+      const prev = largeInflight.get(dedupeKey);
+      if (prev) {
+        const replay = await Promise.race([prev.promise, sleep(240000).then(() => null)]);
+        if (replay && Array.isArray(replay.chunks) && replay.chunks.length) {
+          log(`replaying the in-flight compaction result (${replay.chunks.length} chunk(s)) for session ${sessionId}`);
+          try {
+            res.writeHead(200, {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+              "x-accel-buffering": "no",
+              "x-cb-retries": String(replay.retries || 0),
+            });
+            for (const chunk of replay.chunks) res.write(chunk);
+            res.end();
+          } catch {}
+          return;
+        }
+      } else {
+        let resolveFn = null;
+        const promise = new Promise((r) => { resolveFn = r; });
+        const entry = { promise, resolve: resolveFn, replay: null };
+        dedupeEntry = entry;
+        drainAnyway = true;
+        largeInflight.set(dedupeKey, entry);
+        const cleanup = setTimeout(() => {
+          if (largeInflight.get(dedupeKey) === entry) largeInflight.delete(dedupeKey);
+        }, 300000);
+        try { cleanup.unref?.(); } catch {}
+      }
+    }
+    const finishDedupe = (replay) => {
+      if (!dedupeEntry) return;
+      dedupeEntry.replay = replay;
+      try { dedupeEntry.resolve(replay); } catch {}
+      dedupeEntry = null;
+    };
+    res.on("close", () => {
+      if (dedupeEntry && !drainAnyway) finishDedupe(null);
+    });
+
     // One usage accumulator per request, filled from the forwarded events.
     const usageAcc = newUsageAcc();
     let usageRecorded = false;
@@ -1917,7 +1973,7 @@ async function startServer(upstreamBase, port, mode) {
     }
 
     log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize} max_tokens=${reqJson?.max_tokens ?? reqJson?.max_completion_tokens ?? "default"} session=${sessionId || "-"} key=${keySlot || "-"}${keySlot ? `(${maskKey(keyPool[keySlot - 1])})` : ""}`);
-    if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
+    if (clientGone && !drainAnyway) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
 
     let lastStatus = null;
     let lastStatusBody = null;
@@ -2001,7 +2057,7 @@ async function startServer(upstreamBase, port, mode) {
         }
         await sleep(ms);
       };
-      if (clientGone) { stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
+      if (clientGone && !drainAnyway) { stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
       const retryCount = attempt - 1;
       let up = null;
       try {
@@ -2606,7 +2662,7 @@ async function startServer(upstreamBase, port, mode) {
             const chunk = await readUp(deadline);
             if (chunk === null) break;
             firstByteSeen = true;
-            if (clientGone) { lastErr = "client-gone"; break; }
+            if (clientGone && !drainAnyway) { lastErr = "client-gone"; break; }
             dbg(`up chunk(${chunk.length}): ${snippet(chunk.toString("utf8"), 160)}`);
             const events = ev.feed(decoder.decode(chunk, { stream: true }));
             let bail = null;
@@ -2727,6 +2783,7 @@ async function startServer(upstreamBase, port, mode) {
               }
             }
             if (out === buffered && !sawDone) buffered.push("data: [DONE]\n\n");
+            finishDedupe({ chunks: out.map((c) => String(c)), retries: retryCount });
             for (const chunk of out) { try { rawWrite(chunk); } catch {} }
             endStream();
             try { up.destroy(); } catch {}
@@ -2743,6 +2800,7 @@ async function startServer(upstreamBase, port, mode) {
             ensureStreamHeaders({}, retryCount);
             if (!sawFinish) buffered.push(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
             if (!sawDone) buffered.push("data: [DONE]\n\n");
+            finishDedupe({ chunks: buffered.map((c) => String(c)), retries: retryCount });
             for (const chunk of buffered) { try { rawWrite(chunk); } catch {} }
             endStream();
             try { up.destroy(); } catch {}
@@ -2855,7 +2913,7 @@ async function startServer(upstreamBase, port, mode) {
         // pre-commit failure -> retry (headers may already be sent as early
         // SSE; only keepalives flowed so we can still try a fresh upstream)
         try { up && up.destroy(); } catch {} // discard the failed attempt's socket
-        if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone pre-commit, stop`); return; }
+        if (clientGone && !drainAnyway) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone pre-commit, stop`); return; }
         if (!bailed) {
           lastFailure = `stream ended with no valid events (err=${lastErr?.message || lastErr || "none"})`;
         }
@@ -2892,7 +2950,7 @@ async function startServer(upstreamBase, port, mode) {
         lastFailure = `attempt error: ${err?.message || err}`;
         log(`attempt ${attempt}: ${lastFailure}`);
         try { up && up.destroy(); } catch {}
-        if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); return; }
+        if (clientGone && !drainAnyway) { stopEarlyHeaderTimer(); stopKeepalive(); return; }
         hardFailures++;
         if (hardFailures > MAX_RETRIES) break;
         await retryPause(backoffMs(retryCount));
@@ -2902,6 +2960,7 @@ async function startServer(upstreamBase, port, mode) {
     // give-up path (only after MAX_RETRIES): surface the last failure
     if (BUFFER_UNTIL_COMPLETE) { try { res.write = rawWrite; } catch {} }
     log(`req ${pathAndQuery}: GIVING UP (attempts=${attemptsUsed}, hardFailures=${hardFailures}): ${lastFailure}`);
+    finishDedupe(null);
     // A visible, proxy-authored warning. Never dump the raw upstream error
     // (the desktop would show it as a broken stream and retry the turn), and
     // never close silently: the user must see that the answer is incomplete.

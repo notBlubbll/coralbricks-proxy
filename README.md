@@ -197,7 +197,12 @@ in-band `context_length_exceeded` error**. The proxy protects that turn:
   not a broken file dump;
 - if a compaction summary is cut mid-way after at least 200 characters, the
   proxy delivers what arrived with a synthetic `finish_reason` + `[DONE]`
-  instead of re-running a 700k-token prompt for minutes.
+  instead of re-running a 700k-token prompt for minutes;
+- identical large requests for the same session are **coalesced**: the first
+  copy keeps draining to completion even if its client disconnects, and the
+  retries wait for it and replay the buffered answer. One compaction occupies
+  one key instead of three, which is what caused the `concurrency_limit` 429
+  storms.
 
 ### Retry classes
 
@@ -276,7 +281,7 @@ Per-request overrides (stripped before forwarding): `x-cb-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 78 scenarios: the full
+Spins a mock upstream plus the proxy and asserts 79 scenarios: the full
 pre-commit/post-commit retry matrix, null-field repair, mid-stream healing,
 non-stream passthrough, bulk-JSON conversion, stall retry, 200+8006 same-body
 retry, budget exhaustion surfacing the real error, patient TPM retry, vision
